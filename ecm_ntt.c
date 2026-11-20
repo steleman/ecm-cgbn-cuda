@@ -25,6 +25,9 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 #include <string.h>
 #include "sp.h"
 #include "ecm-impl.h"
+#if defined(WITH_GPU) && !defined(TUNE)
+#include "gpu_ntt.h"
+#endif
 
 #ifdef HAVE_UNISTD_H
 #include <unistd.h> /* for unlink */
@@ -60,9 +63,110 @@ ntt_mul (mpzv_t r, mpzv_t x, mpzv_t y, spv_size_t len, mpzv_t t,
   mpzspv_clear (v, mpzspm);
 }
 
+static void ntt_PolyFromRoots_cpu (mpzv_t, mpzv_t, spv_size_t, mpzv_t,
+    mpzspm_t);
+static int ntt_PolyFromRoots_Tree_cpu (mpzv_t, mpzv_t, spv_size_t, mpzv_t,
+    int, mpzspm_t, mpzv_t *, FILE *);
+
+#if defined(WITH_GPU) && !defined(TUNE)
+/* ECM_GPU_NTT_CHECK=1: the GPU product tree (r, Tree) against the CPU's,
+   mod N. a are the roots (saved before the GPU run, as r may be a). */
+static void
+check_tree (mpzv_t r, mpzv_t a, spv_size_t len, mpzv_t *Tree,
+    mpzspm_t mpzspm)
+{
+  unsigned int lgk = ceil_log2 (len), i;
+  spv_size_t k;
+  listz_t rr = init_list2 (len, 0), tt = init_list2 (4 * len, 0);
+  listz_t *T = NULL;
+  mpz_t u, v;
+
+  if (Tree)
+    {
+      T = (listz_t *) malloc (lgk * sizeof (listz_t));
+      for (i = 0; i < lgk; i++)
+        T[i] = init_list2 (len, 0);
+      ntt_PolyFromRoots_Tree_cpu (rr, a, len, tt, -1, mpzspm, T, NULL);
+    }
+  else
+    ntt_PolyFromRoots_cpu (rr, a, len, tt, mpzspm);
+  mpz_init (u);
+  mpz_init (v);
+  for (k = 0; k < len; k++)
+    {
+      mpz_mod (u, r[k], mpzspm->modulus);
+      mpz_mod (v, rr[k], mpzspm->modulus);
+      if (mpz_cmp (u, v))
+        {
+          fprintf (stderr, "GPU NTT check: product of %lu roots, "
+                   "coefficient %lu differs from the CPU\n", len, k);
+          abort ();
+        }
+    }
+  if (Tree)
+    for (i = 0; i < lgk; i++)
+      for (k = 0; k < len; k++)
+        {
+          mpz_mod (u, Tree[i][k], mpzspm->modulus);
+          mpz_mod (v, T[i][k], mpzspm->modulus);
+          if (mpz_cmp (u, v))
+            {
+              fprintf (stderr, "GPU NTT check: product tree level %u, "
+                       "coefficient %lu differs from the CPU\n", i, k);
+              abort ();
+            }
+        }
+  mpz_clear (u);
+  mpz_clear (v);
+  clear_list (rr, len);
+  clear_list (tt, 4 * len);
+  if (Tree)
+    {
+      for (i = 0; i < lgk; i++)
+        clear_list (T[i], len);
+      free (T);
+    }
+}
+
+/* The GPU product tree, checked if ECM_GPU_NTT_CHECK=1. */
+static int
+gpu_tree (mpzv_t r, mpzv_t a, spv_size_t len, mpzv_t *Tree, mpzspm_t mpzspm)
+{
+  listz_t sa = NULL;
+  int done;
+
+  if (!gpu_ntt_active ())
+    return 0;
+  if (gpu_ntt_check ())
+    {
+      sa = init_list2 (len, 0);
+      list_set (sa, a, len);
+    }
+  done = gpu_poly_from_roots (r, a, len, Tree, mpzspm);
+  if (sa != NULL)
+    {
+      if (done)
+        check_tree (r, sa, len, Tree, mpzspm);
+      clear_list (sa, len);
+    }
+  return done;
+}
+#endif
+
 /* memory: 2 * len mpzspv coeffs */
 void
 ntt_PolyFromRoots (mpzv_t r, mpzv_t a, spv_size_t len, mpzv_t t,
+    mpzspm_t mpzspm)
+{
+#if defined(WITH_GPU) && !defined(TUNE)
+  if (gpu_tree (r, a, len, NULL, mpzspm))
+    return;
+#endif
+  ntt_PolyFromRoots_cpu (r, a, len, t, mpzspm);
+}
+
+static void
+ntt_PolyFromRoots_cpu (mpzv_t r, mpzv_t a, spv_size_t len, mpzv_t t,
     mpzspm_t mpzspm)
 {
   mpzspv_t x;
@@ -105,6 +209,18 @@ ntt_PolyFromRoots (mpzv_t r, mpzv_t a, spv_size_t len, mpzv_t t,
 /* memory: 2 * len mpzspv coeffs */
 int
 ntt_PolyFromRoots_Tree (mpzv_t r, mpzv_t a, spv_size_t len, mpzv_t t,
+    int dolvl, mpzspm_t mpzspm, mpzv_t *Tree, FILE *TreeFile)
+{
+#if defined(WITH_GPU) && !defined(TUNE)
+  if (dolvl == -1 && TreeFile == NULL && gpu_tree (r, a, len, Tree, mpzspm))
+    return 0;
+#endif
+  return ntt_PolyFromRoots_Tree_cpu (r, a, len, t, dolvl, mpzspm, Tree,
+                                     TreeFile);
+}
+
+static int
+ntt_PolyFromRoots_Tree_cpu (mpzv_t r, mpzv_t a, spv_size_t len, mpzv_t t,
     int dolvl, mpzspm_t mpzspm, mpzv_t *Tree, FILE *TreeFile)
 {
   mpzspv_t x;
@@ -288,9 +404,100 @@ void ntt_PolyInvert (mpzv_t q, mpzv_t b, spv_size_t len, mpzv_t t,
 }
 
 
+static int ntt_polyevalT_cpu (mpzv_t, spv_size_t, mpzv_t *, mpzv_t,
+    mpzspv_t, mpzspm_t, char *);
+
+#if defined(WITH_GPU) && !defined(TUNE)
+/* ntt_polyevalT with every level on the GPU (no tree files). 1 if done. */
+static int
+ntt_polyevalT_gpu (mpzv_t b, spv_size_t len, mpzv_t *Tree, mpzv_t T,
+                   mpzspv_t sp_invF, mpzspm_t mpzspm)
+{
+  spv_size_t i;
+  mpzspv_t x = mpzspv_init (2 * len, mpzspm);
+  mpzspv_t y = mpzspv_init (2 * len, mpzspm);
+  int done;
+
+  mpzspv_from_mpzv (x, 0, b, len, mpzspm);
+  mpzspv_mul_ntt(x, 0, x, 0, len, sp_invF, 0, UNUSED, 2 * len, 0, 0, mpzspm,
+    NTT_MUL_STEP_FFT1 + NTT_MUL_STEP_MUL + NTT_MUL_STEP_IFFT);
+  mpzspv_normalise (x, len - 1, len, mpzspm);
+  mpzspv_set (y, 0, x, len - 1, len, mpzspm); /* y = high (b * invF) */
+  mpzspv_reverse (y, 0, len, mpzspm); /* y = rev (high (b * invF)) */
+  mpzspv_clear (x, mpzspm);
+  done = gpu_polyeval_levels (y, len, Tree, T, mpzspm);
+  mpzspv_clear (y, mpzspm);
+  if (!done)
+    return 0;
+  for (i = 0; i < len; i++)
+    mpz_mod (T[i], T[i], mpzspm->modulus);
+  list_swap (b, T, len);
+  return 1;
+}
+#endif
+
 /* memory: 4 * len mpzspv coeffs */
 int
 ntt_polyevalT (mpzv_t b, spv_size_t len, mpzv_t *Tree, mpzv_t T,
+                   mpzspv_t sp_invF, mpzspm_t mpzspm, char *TreeFilenameStem)
+{
+#if defined(WITH_GPU) && !defined(TUNE)
+  if (TreeFilenameStem == NULL && gpu_ntt_active ())
+    {
+      unsigned int lgk = ceil_log2 (len), l;
+      spv_size_t k;
+      listz_t cb = NULL, cT = NULL, *cTree = NULL;
+      int done;
+
+      if (gpu_ntt_check ())
+        {
+          /* copies for the CPU code, which reverses the tree's levels */
+          cb = init_list2 (len, 0);
+          list_set (cb, b, len);
+          cT = init_list2 (4 * len, 0);
+          cTree = (listz_t *) malloc (lgk * sizeof (listz_t));
+          for (l = 0; l < lgk; l++)
+            {
+              cTree[l] = init_list2 (len, 0);
+              list_set (cTree[l], Tree[l], len);
+            }
+        }
+      done = ntt_polyevalT_gpu (b, len, Tree, T, sp_invF, mpzspm);
+      if (cb != NULL)
+        {
+          if (done)
+            {
+              mpz_t u;
+              ntt_polyevalT_cpu (cb, len, cTree, cT, sp_invF, mpzspm, NULL);
+              mpz_init (u);
+              for (k = 0; k < len; k++)
+                {
+                  mpz_mod (u, cb[k], mpzspm->modulus);
+                  if (mpz_cmp (u, b[k]))
+                    {
+                      fprintf (stderr, "GPU NTT check: polyevalT value %lu "
+                               "differs from the CPU\n", k);
+                      abort ();
+                    }
+                }
+              mpz_clear (u);
+            }
+          clear_list (cb, len);
+          clear_list (cT, 4 * len);
+          for (l = 0; l < lgk; l++)
+            clear_list (cTree[l], len);
+          free (cTree);
+        }
+      if (done)
+        return 0;
+    }
+#endif
+  return ntt_polyevalT_cpu (b, len, Tree, T, sp_invF, mpzspm,
+                            TreeFilenameStem);
+}
+
+static int
+ntt_polyevalT_cpu (mpzv_t b, spv_size_t len, mpzv_t *Tree, mpzv_t T,
                    mpzspv_t sp_invF, mpzspm_t mpzspm, char *TreeFilenameStem)
 {
   spv_size_t m, i;

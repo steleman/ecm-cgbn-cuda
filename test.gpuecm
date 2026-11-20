@@ -98,8 +98,9 @@ echo "2^512+1" | $ECM 587 0
 echo "2^1018-1" | $ECM -sigma 3:92 4 0
 checkcode $? 2
 
-# try 2^1019-1: should give an error
-echo "2^1019-1" | $ECM -sigma 3:92 4 0
+# try 2^4097-1: should give an error (the CGBN kernels go to 4096 bits,
+# and N may fill a kernel; 2^1019-1 was the limit before CGBN)
+echo "2^4097-1" | $ECM -sigma 3:92 4 0
 checkcode $? 1
 
 # test for when stage 2 on CPU is needed

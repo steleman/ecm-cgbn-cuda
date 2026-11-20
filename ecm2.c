@@ -23,6 +23,17 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 #include <stdlib.h>
 #include <math.h>
 #include "ecm-impl.h"
+#if defined(WITH_GPU) && !defined(TUNE)
+#include <string.h>
+#include "gpu_roots.h"
+#endif
+
+static int ecm_rootsF_cpu (mpz_t, listz_t, root_params_t *, unsigned long,
+                           curve *, mpmod_t);
+static ecm_roots_state_t *ecm_rootsG_init_cpu (mpz_t, curve *,
+    root_params_t *, unsigned long, unsigned long, mpmod_t);
+static int ecm_rootsG_cpu (mpz_t, listz_t, unsigned long,
+                           ecm_roots_state_t *, mpmod_t);
 
 /* R_i <- q_i * S, 0 <= i < n, where q_i are large integers, S is a point on
    an elliptic curve. Uses max(bits in q_i) modular inversions (one less if 
@@ -427,9 +438,9 @@ addWnm (mpz_t p, point *X, curve *S, mpmod_t modulus, unsigned int m,
    or an error occurred.
 */
 
-int
-ecm_rootsF (mpz_t f, listz_t F, root_params_t *root_params, 
-            unsigned long dF, curve *s, mpmod_t modulus)
+static int
+ecm_rootsF_cpu (mpz_t f, listz_t F, root_params_t *root_params, 
+                unsigned long dF, curve *s, mpmod_t modulus)
 {
   unsigned long i;
   unsigned long muls = 0, gcds = 0;
@@ -600,9 +611,45 @@ ecm_rootsF (mpz_t f, listz_t F, root_params_t *root_params,
    factor in f. If an error occurred, NULL is returned and f is -1.
 */
 
-ecm_roots_state_t *
-ecm_rootsG_init (mpz_t f, curve *X, root_params_t *root_params, 
-                 unsigned long dF, unsigned long blocks, mpmod_t modulus)
+/* The number of progressions of the CPU's tables for G. */
+static unsigned int
+rootsG_nr (root_params_t *root_params, unsigned long dF, unsigned long blocks,
+           mpmod_t modulus)
+{
+  unsigned int T_inv, phid2, nr, S = abs (root_params->S);
+  double bestnr;
+
+  /* Estimate the cost of a modular inversion (in unit of time per 
+     modular multiplication) */
+  if (modulus->repr == ECM_MOD_BASE2)
+    T_inv = 18;
+  else
+    T_inv = 6;
+  
+  /* Guesstimate a value for the number of disjoint progressions to use */
+  bestnr = -(4. + T_inv) + sqrt(12. * (double) dF * (double) blocks * 
+        (T_inv - 3.) * log (2. * root_params->d1) / log (2.) - (4. + T_inv) * 
+        (4. + T_inv));
+  bestnr /= 6. * (double) S * log (2. * root_params->d1) / log (2.0);
+  
+  outputf (OUTPUT_TRACE, "ecm_rootsG_init: bestnr = %f\n", bestnr);
+  
+  if (bestnr < 1.)
+    nr = 1;
+  else
+    nr = (unsigned int) (bestnr + .5);
+
+  phid2 = eulerphi (root_params->d2);
+
+  /* Round up nr to multiple of eulerphi(d2) */
+  if (phid2 > 1)
+    nr = ((nr + (phid2 - 1)) / phid2) * phid2;
+  return nr;
+}
+
+static ecm_roots_state_t *
+ecm_rootsG_init_cpu (mpz_t f, curve *X, root_params_t *root_params, 
+                     unsigned long dF, unsigned long blocks, mpmod_t modulus)
 {
   unsigned int k, phid2;
   unsigned long muls = 0, gcds = 0;
@@ -625,37 +672,18 @@ ecm_rootsG_init (mpz_t f, curve *X, root_params_t *root_params,
       mpz_set_si (f, -1);
       return NULL;
     }
+  state->gpu = NULL;
+  state->check = NULL;
   params = &(state->params);
 
   /* If S < 0, use degree |S| Dickson poly, otherwise use x^S */
   params->dickson_a = (root_params->S < 0) ? -1 : 0;
   params->S = abs (root_params->S);
 
-  /* Estimate the cost of a modular inversion (in unit of time per 
-     modular multiplication) */
-  if (modulus->repr == ECM_MOD_BASE2)
-    T_inv = 18;
-  else
-    T_inv = 6;
-  
-  /* Guesstimate a value for the number of disjoint progressions to use */
-  bestnr = -(4. + T_inv) + sqrt(12. * (double) dF * (double) blocks * 
-        (T_inv - 3.) * log (2. * root_params->d1) / log (2.) - (4. + T_inv) * 
-        (4. + T_inv));
-  bestnr /= 6. * (double) (params->S) * log (2. * root_params->d1) / log (2.0);
-  
-  outputf (OUTPUT_TRACE, "ecm_rootsG_init: bestnr = %f\n", bestnr);
-  
-  if (bestnr < 1.)
-    params->nr = 1;
-  else
-    params->nr = (unsigned int) (bestnr + .5);
-
+  params->nr = rootsG_nr (root_params, dF, blocks, modulus);
   phid2 = eulerphi (root_params->d2);
-
-  /* Round up params->nr to multiple of eulerphi(d2) */
-  if (phid2 > 1)
-    params->nr = ((params->nr + (phid2 - 1)) / phid2) * phid2;
+  T_inv = (modulus->repr == ECM_MOD_BASE2) ? 18 : 6;
+  (void) bestnr;
 
   params->size_fd = params->nr * (params->S + 1);
 
@@ -764,13 +792,22 @@ void
 ecm_rootsG_clear (ecm_roots_state_t *state, ATTRIBUTE_UNUSED mpmod_t modulus)
 {
   unsigned int k;
-  
-  for (k = 0; k < state->params.size_fd; k++)
+
+#if defined(WITH_GPU) && !defined(TUNE)
+  if (state->gpu != NULL)
+    gpu_roots_free ((gpu_roots_t *) state->gpu);
+  if (state->check != NULL)
+    ecm_rootsG_clear ((ecm_roots_state_t *) state->check, modulus);
+#endif
+  if (state->fd != NULL)
     {
-      mpres_clear (state->fd[k].x, modulus);
-      mpres_clear (state->fd[k].y, modulus);
+      for (k = 0; k < state->params.size_fd; k++)
+        {
+          mpres_clear (state->fd[k].x, modulus);
+          mpres_clear (state->fd[k].y, modulus);
+        }
+      free (state->fd);
     }
-  free (state->fd);
   
   if(state->size_T != 0){
       for (k = 0; k < state->size_T; k++)
@@ -794,8 +831,8 @@ ecm_rootsG_clear (ecm_roots_state_t *state, ATTRIBUTE_UNUSED mpmod_t modulus)
    Cannot return an error.
 */
 
-int 
-ecm_rootsG (mpz_t f, listz_t G, unsigned long dF, ecm_roots_state_t *state, 
+static int 
+ecm_rootsG_cpu (mpz_t f, listz_t G, unsigned long dF, ecm_roots_state_t *state, 
             mpmod_t modulus)
 {
   unsigned long i;
@@ -852,3 +889,643 @@ ecm_rootsG (mpz_t f, listz_t G, unsigned long dF, ecm_roots_state_t *state,
   
   return youpi;
 }
+
+/* ------------------------------------------------------------------ */
+/* The roots on the GPU (gpu_roots.cu): the same roots, in the same
+   order, as the CPU code above; the CPU's loop is replayed as the schedule
+   the GPU runs.
+
+   By default the tables are the CPU's (same progressions, same points), so
+   the GPU sees exactly the non-invertible values the CPU would, and the
+   CPU then takes over from the table at the start of that call: results
+   are those of the CPU code, factors found in the tables included.
+   ECM_GPU_ROOTS_ADDS=n > 0: k times more progressions (k sets of them,
+   init_progression_coeffs' k), so that an update is about n point
+   additions: faster (RSA-1024, B1 = 2.6e8: stage 2 10.7 -> 8.2 s with n =
+   32768), the same roots, but the tables' intermediate points differ, so
+   a factor the CPU would find there by chance (a "lucky" collision, which
+   matters for small primes only) may not be found.
+   ECM_GPU_ROOTS=0: CPU only. ECM_GPU_ROOTS_CHECK=1: the CPU code runs too
+   and every root is compared. */
+
+#if defined(WITH_GPU) && !defined(TUNE)
+
+static unsigned long
+gpu_roots_target (void)
+{
+  const char *e = getenv ("ECM_GPU_ROOTS_ADDS");
+  return (e != NULL) ? strtoul (e, NULL, 10) : 0;
+}
+
+static int
+gpu_roots_check (void)
+{
+  const char *e = getenv ("ECM_GPU_ROOTS_CHECK");
+  return e != NULL && strcmp (e, "1") == 0;
+}
+
+typedef struct
+{
+  int *v;
+  unsigned long n, alloc;
+} sched_t;
+
+static void
+sched_push (sched_t *s, int e)
+{
+  if (s->n == s->alloc)
+    {
+      s->alloc = s->alloc ? 2 * s->alloc : 4096;
+      s->v = (int *) realloc (s->v, s->alloc * sizeof (int));
+      ASSERT_ALWAYS (s->v != NULL);
+    }
+  s->v[s->n++] = e;
+}
+
+/* The table of coeffs[] * X on the GPU (k sets of nr progressions). */
+static gpu_roots_t *
+gpu_table (listz_t coeffs, unsigned long nr, unsigned int S, curve *X,
+           mpmod_t modulus, int *bad)
+{
+  mpz_t A, x, y;
+  gpu_roots_t *g;
+  unsigned long i;
+
+  /* as the CPU code: the last coefficient of every progression but the
+     first is 1, its point then replaced by the first progression's */
+  for (i = S + 1; i < nr * (S + 1); i += S + 1)
+    mpz_set_ui (coeffs[i + S], 1);
+  mpz_init (A);
+  mpz_init (x);
+  mpz_init (y);
+  mpres_get_z (A, X->A, modulus);
+  mpres_get_z (x, X->x, modulus);
+  mpres_get_z (y, X->y, modulus);
+  g = gpu_roots_init (modulus->orig_modulus, A, x, y, coeffs, nr, S, bad);
+  mpz_clear (A);
+  mpz_clear (x);
+  mpz_clear (y);
+  return g;
+}
+
+/* 1 and *ret if done on the GPU, 0 if the CPU must do it (also when the
+   GPU sees a factor: the CPU code then finds it, as it would have). */
+static int
+ecm_rootsF_gpu (int *ret, listz_t F, root_params_t *root_params,
+                unsigned long dF, curve *s, mpmod_t modulus)
+{
+  progression_params_t params;
+  unsigned long k, i, nr, next;
+  unsigned int rsieve;
+  listz_t coeffs;
+  mpz_t t;
+  gpu_roots_t *g;
+  int bad;
+  sched_t sc = {NULL, 0, 0};
+  long st = cputime ();
+
+  if (dF == 0 || s->disc != 0 || !gpu_roots_active (modulus->orig_modulus))
+    return 0;
+  init_roots_params (&params, root_params->S, root_params->d1,
+                     root_params->d2, 1.0);
+  k = gpu_roots_target () / ((unsigned long) params.nr * params.S + 1);
+  if (k < 1)
+    k = 1;
+  if (k * params.nr > dF)
+    k = (dF + params.nr - 1) / params.nr;
+  nr = k * params.nr;
+  mpz_init (t);
+  coeffs = init_progression_coeffs (t, params.dsieve, root_params->d2, k, 6,
+                                    params.S, params.dickson_a);
+  mpz_clear (t);
+  if (coeffs == NULL)
+    return 0;
+  g = gpu_table (coeffs, nr, params.S, s, modulus, &bad);
+  clear_list (coeffs, nr * (params.S + 1));
+  if (g == NULL)
+    return 0;
+  /* ecm_rootsF's loop with nr progressions */
+  next = 0;
+  rsieve = params.rsieve;
+  for (i = 0; i < dF; )
+    {
+      if (gcd ((unsigned long) rsieve, (unsigned long) params.dsieve) == 1UL)
+        {
+          if (next == nr)
+            {
+              sched_push (&sc, -1);
+              next = 0;
+            }
+          if (gcd ((unsigned long) rsieve, root_params->d1) == 1UL)
+            {
+              sched_push (&sc, (int) next);
+              i++;
+            }
+          next++;
+        }
+      rsieve += 6;
+    }
+  bad = gpu_roots_run (g, sc.v, sc.n, F, dF);
+  gpu_roots_free (g);
+  free (sc.v);
+  if (bad)
+    return 0;
+  outputf (OUTPUT_VERBOSE, "Computing roots of F on the GPU (%lu "
+           "progressions) took %ldms\n", nr, elltime (st, cputime ()));
+  *ret = ECM_NO_FACTOR_FOUND;
+  return 1;
+}
+
+static ecm_roots_state_t *
+ecm_rootsG_init_gpu (curve *X, root_params_t *root_params, unsigned long dF,
+                     unsigned long blocks, mpmod_t modulus)
+{
+  ecm_roots_state_t *state;
+  progression_params_t *params;
+  unsigned int phid2;
+  unsigned long k, nr;
+  listz_t coeffs;
+  gpu_roots_t *g;
+  int bad;
+  long st = cputime ();
+
+  if (X->disc != 0 || !gpu_roots_active (modulus->orig_modulus))
+    return NULL;
+  phid2 = eulerphi (root_params->d2);
+  k = gpu_roots_target () / ((unsigned long) phid2 * abs (root_params->S)
+                             + 1);
+  if (k < 1)
+    k = 1;
+  if (k * phid2 > dF * blocks)
+    k = (dF * blocks + phid2 - 1) / phid2;
+  nr = k * phid2;
+  coeffs = init_progression_coeffs (root_params->i0, root_params->d2,
+                                    root_params->d1, k, 1,
+                                    abs (root_params->S),
+                                    (root_params->S < 0) ? -1 : 0);
+  if (coeffs == NULL)
+    return NULL;
+  g = gpu_table (coeffs, nr, abs (root_params->S), X, modulus, &bad);
+  clear_list (coeffs, nr * (abs (root_params->S) + 1));
+  if (g == NULL)
+    return NULL;
+  state = (ecm_roots_state_t *) malloc (sizeof (ecm_roots_state_t));
+  ASSERT_ALWAYS (state != NULL);
+  params = &(state->params);
+  params->dickson_a = (root_params->S < 0) ? -1 : 0;
+  params->S = abs (root_params->S);
+  params->nr = nr;
+  params->size_fd = nr * (params->S + 1);
+  params->next = 0;
+  params->dsieve = 1;
+  params->rsieve = 0;
+  state->X = X;
+  state->fd = NULL;
+  state->size_T = 0;
+  state->T = NULL;
+  state->gpu = g;
+  state->check = NULL;
+  outputf (OUTPUT_VERBOSE, "Initializing table of differences for G on the "
+           "GPU (%lu progressions) took %ldms\n", nr,
+           elltime (st, cputime ()));
+  return state;
+}
+
+/* The GPU's G roots; if it sees a factor, the CPU takes over from the
+   table at the start of this call (as ecm2.c, with nr progressions). */
+static int
+ecm_rootsG_gpu (mpz_t f, listz_t G, unsigned long dF,
+                ecm_roots_state_t *state, mpmod_t modulus)
+{
+  progression_params_t *params = &(state->params);
+  unsigned long i, next = params->next;
+  unsigned int rsieve = params->rsieve, k;
+  sched_t sc = {NULL, 0, 0};
+  long st = cputime ();
+  int r;
+
+  for (i = 0; i < dF; )
+    {
+      if (next == params->nr)
+        {
+          sched_push (&sc, -1);
+          next = 0;
+        }
+      if (gcd ((unsigned long) rsieve, (unsigned long) params->dsieve) == 1UL)
+        {
+          sched_push (&sc, (int) next);
+          i++;
+        }
+      next++;
+      rsieve++;
+    }
+  r = gpu_roots_run ((gpu_roots_t *) state->gpu, sc.v, sc.n, G, dF);
+  free (sc.v);
+  if (r == 0)
+    {
+      params->next = next;
+      params->rsieve = rsieve;
+      outputf (OUTPUT_VERBOSE, "Computing roots of G on the GPU took "
+               "%ldms\n", elltime (st, cputime ()));
+      return ECM_NO_FACTOR_FOUND;
+    }
+  /* the CPU takes over */
+  {
+    mpz_t *x = (mpz_t *) malloc (params->size_fd * sizeof (mpz_t));
+    mpz_t *y = (mpz_t *) malloc (params->size_fd * sizeof (mpz_t));
+    ASSERT_ALWAYS (x != NULL && y != NULL);
+    for (k = 0; k < params->size_fd; k++)
+      {
+        mpz_init (x[k]);
+        mpz_init (y[k]);
+      }
+    r = gpu_roots_table ((gpu_roots_t *) state->gpu, x, y, f);
+    gpu_roots_free ((gpu_roots_t *) state->gpu);
+    state->gpu = NULL;
+    state->fd = (point *) malloc (params->size_fd * sizeof (point));
+    ASSERT_ALWAYS (state->fd != NULL);
+    for (k = 0; k < params->size_fd; k++)
+      {
+        mpres_init (state->fd[k].x, modulus);
+        mpres_init (state->fd[k].y, modulus);
+        mpres_set_z (state->fd[k].x, x[k], modulus);
+        mpres_set_z (state->fd[k].y, y[k], modulus);
+        mpz_clear (x[k]);
+        mpz_clear (y[k]);
+      }
+    free (x);
+    free (y);
+    state->size_T = params->size_fd + 4;
+    state->T = (mpres_t *) malloc (state->size_T * sizeof (mpres_t));
+    ASSERT_ALWAYS (state->T != NULL);
+    for (k = 0; k < state->size_T; k++)
+      mpres_init (state->T[k], modulus);
+    outputf (OUTPUT_VERBOSE, "GPU roots of G: a product was not invertible, "
+             "the CPU takes over\n");
+    if (r)
+      return ECM_FACTOR_FOUND_STEP2; /* f was found making the table affine */
+    return ecm_rootsG_cpu (f, G, dF, state, modulus);
+  }
+}
+
+static void
+check_roots (const char *what, listz_t a, listz_t b, unsigned long n)
+{
+  unsigned long i;
+  for (i = 0; i < n; i++)
+    if (mpz_cmp (a[i], b[i]) != 0)
+      {
+        fprintf (stderr, "GPU roots check: %s[%lu] differs from the CPU\n",
+                 what, i);
+        abort ();
+      }
+}
+#endif
+
+int
+ecm_rootsF (mpz_t f, listz_t F, root_params_t *root_params, 
+            unsigned long dF, curve *s, mpmod_t modulus)
+{
+#if defined(WITH_GPU) && !defined(TUNE)
+  int youpi;
+  if (ecm_rootsF_gpu (&youpi, F, root_params, dF, s, modulus))
+    {
+      if (gpu_roots_check ())
+        {
+          listz_t FF = init_list2 (dF, 0);
+          mpz_t f2;
+          int y2;
+          mpz_init (f2);
+          y2 = ecm_rootsF_cpu (f2, FF, root_params, dF, s, modulus);
+          /* The CPU may find a factor on an intermediate point of its
+             table of differences, which the GPU's (k times as many
+             progressions, so other intermediate points) does not have:
+             not an error, the roots are what must agree. */
+          if (y2 != ECM_NO_FACTOR_FOUND)
+            fprintf (stderr, "GPU roots check: the CPU found a factor in its "
+                     "table for F, not compared\n");
+          else
+            check_roots ("F", F, FF, dF);
+          mpz_clear (f2);
+          clear_list (FF, dF);
+        }
+      return youpi;
+    }
+#endif
+  return ecm_rootsF_cpu (f, F, root_params, dF, s, modulus);
+}
+
+ecm_roots_state_t *
+ecm_rootsG_init (mpz_t f, curve *X, root_params_t *root_params, 
+                 unsigned long dF, unsigned long blocks, mpmod_t modulus)
+{
+#if defined(WITH_GPU) && !defined(TUNE)
+  ecm_roots_state_t *state = ecm_rootsG_init_gpu (X, root_params, dF, blocks,
+                                                  modulus);
+  if (state != NULL)
+    {
+      if (gpu_roots_check ())
+        {
+          mpz_t f2;
+          mpz_init (f2);
+          state->check = ecm_rootsG_init_cpu (f2, X, root_params, dF, blocks,
+                                              modulus);
+          if (state->check == NULL) /* see ecm_rootsF */
+            fprintf (stderr, "GPU roots check: the CPU found a factor in its "
+                     "table for G, not compared\n");
+          mpz_clear (f2);
+        }
+      return state;
+    }
+#endif
+  return ecm_rootsG_init_cpu (f, X, root_params, dF, blocks, modulus);
+}
+
+int 
+ecm_rootsG (mpz_t f, listz_t G, unsigned long dF, ecm_roots_state_t *state, 
+            mpmod_t modulus)
+{
+#if defined(WITH_GPU) && !defined(TUNE)
+  if (state->gpu != NULL)
+    {
+      int youpi = ecm_rootsG_gpu (f, G, dF, state, modulus);
+      if (state->check != NULL && youpi == ECM_NO_FACTOR_FOUND)
+        {
+          listz_t GG = init_list2 (dF, 0);
+          mpz_t f2;
+          mpz_init (f2);
+          if (ecm_rootsG_cpu (f2, GG, dF,
+                              (ecm_roots_state_t *) state->check, modulus)
+              != ECM_NO_FACTOR_FOUND)
+            {
+              /* see ecm_rootsF; the CPU's state is not usable any more */
+              fprintf (stderr, "GPU roots check: the CPU found a factor in its "
+                       "table for G, not compared\n");
+              ecm_rootsG_clear ((ecm_roots_state_t *) state->check, modulus);
+              state->check = NULL;
+            }
+          else
+            check_roots ("G", G, GG, dF);
+          mpz_clear (f2);
+          clear_list (GG, dF);
+        }
+      return youpi;
+    }
+#endif
+  return ecm_rootsG_cpu (f, G, dF, state, modulus);
+}
+
+/* ------------------------------------------------------------------ */
+/* Stage 2 of C curves at once, on the GPU (gpu_roots.cu, gpu_ntt.cu):
+   the same F, G, H and values as stage2.c (with the NTT), per curve, and
+   the same gcd. The tables of differences are the CPU's (its numbers of
+   progressions), for all curves at once; a curve whose table or roots
+   give a value that is not invertible (where stage2.c may find a factor
+   in its tables) gets res[c] = -1, for the caller to do it alone. */
+
+#if defined(WITH_GPU) && !defined(TUNE)
+#include "gpu_ntt.h"
+
+/* thread-local hook of stage2.c: the product before the gcd */
+extern __thread mpz_ptr ecm_stage2_product;
+
+static int
+batch_check (void)
+{
+  const char *e = getenv ("ECM_GPU_BATCH_CHECK");
+  return e != NULL && strcmp (e, "1") == 0;
+}
+
+static int
+ecm_stage2_batch_chunk (mpz_t *f, int *res, unsigned C, curve *P,
+                        mpmod_t modulus, unsigned long dF, unsigned long k,
+                        root_params_t *root_params)
+{
+  progression_params_t params;
+  mpzspm_t mpzspm;
+  gpu_s2batch_t *b;
+  gpu_roots_t *g;
+  listz_t coeffs;
+  mpz_t *A, *x, *y, *prod, t;
+  unsigned char *bad;
+  unsigned c, W, phid2, nrG;
+  unsigned long i, nr, next, blk;
+  unsigned int rsieve;
+  sched_t sc = {NULL, 0, 0};
+  const void *roots;
+  long st = cputime ();
+
+  if (C == 0 || !gpu_roots_active (modulus->orig_modulus))
+    return 0;
+  mpzspm = mpzspm_init (2 * dF, modulus->orig_modulus);
+  if (mpzspm == NULL)
+    return 0;
+  b = gpu_s2batch_new (mpzspm, C, dF);
+  if (b == NULL)
+    {
+      mpzspm_clear (mpzspm);
+      return 0;
+    }
+  A = (mpz_t *) malloc (C * sizeof (mpz_t));
+  x = (mpz_t *) malloc (C * sizeof (mpz_t));
+  y = (mpz_t *) malloc (C * sizeof (mpz_t));
+  prod = (mpz_t *) malloc (C * sizeof (mpz_t));
+  bad = (unsigned char *) calloc (C, 1);
+  ASSERT_ALWAYS (A && x && y && prod && bad);
+  for (c = 0; c < C; c++)
+    {
+      mpz_init (A[c]);
+      mpz_init (x[c]);
+      mpz_init (y[c]);
+      mpz_init (prod[c]);
+      mpres_get_z (A[c], P[c].A, modulus);
+      mpres_get_z (x[c], P[c].x, modulus);
+      mpres_get_z (y[c], P[c].y, modulus);
+    }
+
+  /* F: the CPU's progressions (init_roots_params), its loop's schedule */
+  init_roots_params (&params, root_params->S, root_params->d1,
+                     root_params->d2, 1.0);
+  nr = params.nr;
+  mpz_init (t);
+  coeffs = init_progression_coeffs (t, params.dsieve, root_params->d2, 1, 6,
+                                    params.S, params.dickson_a);
+  mpz_clear (t);
+  ASSERT_ALWAYS (coeffs != NULL);
+  for (i = params.S + 1; i < nr * (params.S + 1); i += params.S + 1)
+    mpz_set_ui (coeffs[i + params.S], 1);
+  g = gpu_roots_batch_init (modulus->orig_modulus, C, (const mpz_t *) A,
+                            (const mpz_t *) x, (const mpz_t *) y, coeffs, nr,
+                            params.S, bad);
+  clear_list (coeffs, nr * (params.S + 1));
+  ASSERT_ALWAYS (g != NULL);
+  W = gpu_roots_bits (g) / 64;
+  next = 0;
+  rsieve = params.rsieve;
+  for (i = 0; i < dF; )
+    {
+      if (gcd ((unsigned long) rsieve, (unsigned long) params.dsieve) == 1UL)
+        {
+          if (next == nr)
+            {
+              sched_push (&sc, -1);
+              next = 0;
+            }
+          if (gcd ((unsigned long) rsieve, root_params->d1) == 1UL)
+            {
+              sched_push (&sc, (int) next);
+              i++;
+            }
+          next++;
+        }
+      rsieve += 6;
+    }
+  roots = gpu_roots_batch_run (g, sc.v, sc.n, dF, bad);
+  gpu_s2batch_F (b, roots, W);
+  gpu_roots_free (g);
+  outputf (OUTPUT_VERBOSE, "GPU batch of %u curves: F, its tree and 1/F "
+           "took %ldms\n", C, elltime (st, cputime ()));
+
+  /* G: the CPU's progressions (rootsG_nr), k blocks of dF roots */
+  st = cputime ();
+  nrG = rootsG_nr (root_params, dF, k, modulus);
+  phid2 = eulerphi (root_params->d2);
+  coeffs = init_progression_coeffs (root_params->i0, root_params->d2,
+                                    root_params->d1, nrG / phid2, 1,
+                                    abs (root_params->S),
+                                    (root_params->S < 0) ? -1 : 0);
+  ASSERT_ALWAYS (coeffs != NULL);
+  for (i = abs (root_params->S) + 1; i < nrG * (abs (root_params->S) + 1);
+       i += abs (root_params->S) + 1)
+    mpz_set_ui (coeffs[i + abs (root_params->S)], 1);
+  g = gpu_roots_batch_init (modulus->orig_modulus, C, (const mpz_t *) A,
+                            (const mpz_t *) x, (const mpz_t *) y, coeffs, nrG,
+                            abs (root_params->S), bad);
+  clear_list (coeffs, nrG * (abs (root_params->S) + 1));
+  ASSERT_ALWAYS (g != NULL);
+  next = 0;
+  rsieve = 0;
+  for (blk = 0; blk < k; blk++)
+    {
+      sc.n = 0;
+      for (i = 0; i < dF; )
+        {
+          if (next == nrG)
+            {
+              sched_push (&sc, -1);
+              next = 0;
+            }
+          sched_push (&sc, (int) next); /* dsieve = 1: every one */
+          i++;
+          next++;
+          rsieve++;
+        }
+      roots = gpu_roots_batch_run (g, sc.v, sc.n, dF, bad);
+      gpu_s2batch_G (b, roots, W, blk == 0);
+    }
+  gpu_roots_free (g);
+  free (sc.v);
+  outputf (OUTPUT_VERBOSE, "GPU batch of %u curves: %lu blocks of G took "
+           "%ldms\n", C, k, elltime (st, cputime ()));
+
+  st = cputime ();
+  gpu_s2batch_finish (b, prod);
+  gpu_s2batch_free (b);
+  for (c = 0; c < C; c++)
+    {
+      if (bad[c])
+        res[c] = -1;
+      else
+        {
+          mpz_mod (prod[c], prod[c], modulus->orig_modulus);
+          mpz_gcd (f[c], prod[c], modulus->orig_modulus);
+          res[c] = (mpz_cmp_ui (f[c], 1) > 0) ? ECM_FACTOR_FOUND_STEP2
+                                               : ECM_NO_FACTOR_FOUND;
+        }
+      if (batch_check () && !bad[c])
+        {
+          /* the same curve through stage2 (per curve), its product */
+          mpz_t pr, ff;
+          int r2;
+          mpz_init (pr);
+          mpz_init (ff);
+          ecm_stage2_product = pr;
+          r2 = stage2 (ff, &P[c], modulus, dF, k, root_params, 1, NULL, c + 1,
+                       NULL);
+          ecm_stage2_product = NULL;
+          if (r2 == ECM_NO_FACTOR_FOUND || r2 == ECM_FACTOR_FOUND_STEP2)
+            {
+              mpz_mod (pr, pr, modulus->orig_modulus);
+              if (mpz_cmp (pr, prod[c]) != 0)
+                {
+                  fprintf (stderr, "GPU batch check: the product of curve %u "
+                           "differs from stage2's\n", c);
+                  abort ();
+                }
+            }
+          mpz_clear (pr);
+          mpz_clear (ff);
+        }
+      mpz_clear (A[c]);
+      mpz_clear (x[c]);
+      mpz_clear (y[c]);
+      mpz_clear (prod[c]);
+    }
+  outputf (OUTPUT_VERBOSE, "GPU batch of %u curves: the values and their "
+           "products took %ldms\n", C, elltime (st, cputime ()));
+  free (A);
+  free (x);
+  free (y);
+  free (prod);
+  free (bad);
+  mpzspm_clear (mpzspm);
+  return 1;
+}
+/* All C curves, in chunks that fit in the GPU's free memory
+   (ECM_GPU_BATCH_CURVES: at most that many per chunk). Returns 0 if
+   nothing could be done (res unchanged), else 1 (res[c] as above). */
+int
+ecm_stage2_batch (mpz_t *f, int *res, unsigned C, curve *P, mpmod_t modulus,
+                  unsigned long dF, unsigned long k,
+                  root_params_t *root_params)
+{
+  mpzspm_t mpzspm;
+  size_t per, avail;
+  unsigned long chunk, c0;
+  const char *e = getenv ("ECM_GPU_BATCH_CURVES");
+
+  if (C == 0 || !gpu_roots_active (modulus->orig_modulus))
+    return 0;
+  mpzspm = mpzspm_init (2 * dF, modulus->orig_modulus);
+  if (mpzspm == NULL || mpzspm->gpu == NULL)
+    {
+      if (mpzspm != NULL)
+        mpzspm_clear (mpzspm);
+      return 0;
+    }
+  /* device memory per curve: the polynomials, plus the tables and roots */
+  per = gpu_s2batch_bytes (mpzspm, 1, dF)
+        + 4 * dF * (mpz_sizeinbase (modulus->orig_modulus, 2) / 8 + 64);
+  mpzspm_clear (mpzspm);
+  avail = gpu_free_memory ();
+  chunk = (per > 0) ? (unsigned long) (avail * 0.6 / per) : 0;
+  if (e != NULL && strtoul (e, NULL, 10) > 0 && strtoul (e, NULL, 10) < chunk)
+    chunk = strtoul (e, NULL, 10);
+  if (chunk == 0)
+    return 0;
+  outputf (OUTPUT_VERBOSE, "GPU batch stage 2: %u curves, chunks of at "
+           "most %lu (%.0f MB per curve)\n", C, chunk, per / 1048576.);
+  for (c0 = 0; c0 < C; c0 += chunk)
+    {
+      unsigned n = (C - c0 < chunk) ? (unsigned) (C - c0) : (unsigned) chunk;
+      if (!ecm_stage2_batch_chunk (f + c0, res + c0, n, P + c0, modulus, dF,
+                                   k, root_params))
+        {
+          unsigned i;
+          for (i = 0; i < n; i++)
+            res[c0 + i] = -1; /* the caller does them */
+        }
+    }
+  return 1;
+}
+#endif

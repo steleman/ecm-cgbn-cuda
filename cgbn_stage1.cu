@@ -54,7 +54,21 @@ http://www.gnu.org/licenses/ or write to the Free Software Foundation, Inc.,
 #define CHECK_ERROR 1
 
 // Tested with check_gpuecm.sage
-#define CARRY_BITS 6
+/* N may fill the kernel's width: every addition's carry out of the
+   width is handled (normalize_addition), so no bits are kept spare. (Was
+   6, so a 1024-bit N needed the 1536-bit kernel.) */
+#define CARRY_BITS 0
+
+/* The kernel widths, every 128 bits up to 4096: (threads per instance,
+   bits). Fewer threads per instance are faster as long as an instance
+   fits (GMP-ECM's choice: 4 up to 512 bits, 8 up to 2048, 16 above). */
+#define ECM_CGBN_WIDTHS(X)                                                   \
+  X(4, 256)  X(4, 384)  X(4, 512)                                           \
+  X(8, 640)  X(8, 768)  X(8, 896)  X(8, 1024) X(8, 1152) X(8, 1280)         \
+  X(8, 1408) X(8, 1536) X(8, 1664) X(8, 1792) X(8, 1920) X(8, 2048)         \
+  X(16, 2176) X(16, 2304) X(16, 2432) X(16, 2560) X(16, 2688) X(16, 2816)   \
+  X(16, 2944) X(16, 3072) X(16, 3200) X(16, 3328) X(16, 3456) X(16, 3584)   \
+  X(16, 3712) X(16, 3840) X(16, 3968) X(16, 4096)
 
 // Can dramatically change compile time
 #if 1
@@ -184,6 +198,14 @@ class curve_t {
       }
   }
 
+  // Normalize after an addition that carried out of the width (carry != 0):
+  // then r + 2^BITS >= modulus, and r + 2^BITS - modulus < modulus.
+  __device__ FORCE_INLINE void normalize_addition(bn_t &r, const bn_t &modulus, int32_t carry) {
+      if (carry || cgbn_compare(_env, r, modulus) >= 0) {
+          cgbn_sub(_env, r, r, modulus);
+      }
+  }
+
   // Normalize after subtraction (handled instead by checking carry)
   /*
   __device__ FORCE_INLINE void normalize_subtraction(bn_t &r, const bn_t &modulus) {
@@ -221,18 +243,13 @@ class curve_t {
         assert_normalized(temp, modulus);
     }
 
-    // Can't overflow because of CARRY_BITS
+    // May carry out of the width when N fills it: r + temp + 1 < 2 modulus,
+    // so one subtraction then brings it below the modulus.
     int32_t carry_q = cgbn_add(_env, r, r, temp);
     carry_q += cgbn_add_ui32(_env, r, r, t1_0 != 0); // add 1
 
     if (carry_q > 0) {
-        // This should never happen,
-        // if CHECK_ERROR, no need for the conditional call to cgbn_sub
-        if (CHECK_ERROR) {
-            _context.report_error(cgbn_positive_overflow);
-        } else {
-            cgbn_sub(_env, r, r, modulus);
-        }
+        cgbn_sub(_env, r, r, modulus);
     }
 
     // 0 <= r, temp < modulus => r + temp + 1 < 2*modulus
@@ -266,14 +283,12 @@ class curve_t {
     /* Might be nice to add a macro that verifies no carry out of cgbn_add */
 
     // Is there anything interesting like only one of these can overflow?
-    cgbn_add(_env, t, v, w); // t = (bZ + bX)
-    normalize_addition(t, modulus);
+    normalize_addition(t, modulus, cgbn_add(_env, t, v, w)); // t = (bZ + bX)
     if (cgbn_sub(_env, v, v, w)) // v = (bZ - bX)
         cgbn_add(_env, v, v, modulus);
 
 
-    cgbn_add(_env, w, u, q); // w = (aZ + aX)
-    normalize_addition(w, modulus);
+    normalize_addition(w, modulus, cgbn_add(_env, w, u, q)); // w = (aZ + aX)
     if (cgbn_sub(_env, u, u, q)) // u = (aZ - aX)
         cgbn_add(_env, u, u, modulus);
     if (VERIFY_NORMALIZED) {
@@ -315,8 +330,7 @@ class curve_t {
     special_mult_ui32(dK, d, modulus, np0); // dK = K*d
         assert_normalized(dK, modulus);
 
-    cgbn_add(_env, u, BB, dK); // BB + dK
-    normalize_addition(u, modulus);
+    normalize_addition(u, modulus, cgbn_add(_env, u, BB, dK)); // BB + dK
     if (VERIFY_NORMALIZED) {
         assert_normalized(K, modulus);
         assert_normalized(dK, modulus);
@@ -328,8 +342,7 @@ class curve_t {
     normalize_addition(u, modulus);
         assert_normalized(u, modulus);
 
-    cgbn_add(_env, w, DA, CB); // DA + CB
-    normalize_addition(w, modulus);
+    normalize_addition(w, modulus, cgbn_add(_env, w, DA, CB)); // DA + CB
     if (cgbn_sub(_env, v, DA, CB)) // DA - CB
         cgbn_add(_env, v, v, modulus);
     if (VERIFY_NORMALIZED) {
@@ -347,8 +360,11 @@ class curve_t {
         assert_normalized(v, modulus);
 
     // v = bZ is finalized
-    cgbn_shift_left(_env, v, v, 1); // double
-    normalize_addition(v, modulus);
+    {
+      int32_t top = cgbn_extract_bits_ui32(_env, v, params::BITS-1, 1);
+      cgbn_shift_left(_env, v, v, 1); // double
+      normalize_addition(v, modulus, top);
+    }
         assert_normalized(v, modulus);
   }
 };
@@ -708,80 +724,30 @@ int cgbn_ecm_stage1(mpz_t *factors, int *array_found,
    */
   /* NOTE: Custom kernel changes here
    * For "Compiling custom kernel for %d bits should be XX% faster"
-   * Change the 512 in cgbn_params_t<4, 512> cgbn_params_small;
-   * to the suggested value (a multiple of 32 >= bits + 6).
-   * You may need to change the 4 to an 8 (or 16) if bits >512, >2048
+   * add that width (a multiple of 32 >= bits) to ECM_CGBN_WIDTHS.
    */
-  /** TODO: try with const vector for BITs/TPI, see if compiler is happy */
-  std::vector<uint32_t> available_kernels;
-
+  /* The kernels: one per width of ECM_CGBN_WIDTHS, the narrowest that
+     holds N is used (N may fill it, see CARRY_BITS). */
   typedef cgbn_params_t<4, 512>   cgbn_params_small;
   typedef cgbn_params_t<8, 1024>  cgbn_params_medium;
-  available_kernels.push_back((uint32_t)cgbn_params_small::BITS);
-  available_kernels.push_back((uint32_t)cgbn_params_medium::BITS);
-
-#ifndef IS_DEV_BUILD
-  /**
-   * TPI and BITS have to be set at compile time. Adding multiple cgbn_params
-   * (and their associated kernels) allows for better dynamic selection based
-   * on the size of N (e.g. N < 1024, N < 2048, N < 4096) but increase compile
-   * time and binary size. A few reasonable sizes are included and a verbose
-   * warning is printed when a particular N might benefit from a custom sized
-   * kernel.
-   */
-  typedef cgbn_params_t<8, 1536>  cgbn_params_1536;
-  typedef cgbn_params_t<8, 2048>  cgbn_params_2048;
-  typedef cgbn_params_t<16, 3072> cgbn_params_3072;
-  typedef cgbn_params_t<16, 4096> cgbn_params_4096;
-  available_kernels.push_back((uint32_t)cgbn_params_1536::BITS);
-  available_kernels.push_back((uint32_t)cgbn_params_2048::BITS);
-  available_kernels.push_back((uint32_t)cgbn_params_3072::BITS);
-  available_kernels.push_back((uint32_t)cgbn_params_4096::BITS);
-#endif
 
   /* Pointer to CUDA kernel. */
   void(*kernel)(cgbn_error_report_t *, uint64_t, uint64_t, uint64_t,
         uint32_t*, uint32_t*, uint32_t, uint32_t, uint32_t) = NULL;
 
   size_t n_log2 = mpz_sizeinbase(N, 2);
-  for (int k_i = 0; k_i < available_kernels.size(); k_i++) {
-    uint32_t kernel_bits = available_kernels[k_i];
-    if (kernel_bits >= n_log2 + CARRY_BITS) {
-      BITS = kernel_bits;
+#define ECM_CGBN_SELECT(T, B)                                                \
+  if (kernel == NULL && n_log2 + CARRY_BITS <= (B)) {                         \
+      BITS = (B);                                                             \
+      TPI = (T);                                                              \
+      kernel = kernel_double_add<cgbn_params_t<T, B> >;                       \
+  }
+  ECM_CGBN_WIDTHS(ECM_CGBN_SELECT)
+#undef ECM_CGBN_SELECT
+  if (kernel != NULL) {
       assert( BITS % 32 == 0 );
-
-      /* Print some debug info about kernel. */
-      /* TODO: return kernelAttr and validate maxThreadsPerBlock. */
-      if (BITS == cgbn_params_small::BITS) {
-        TPI = cgbn_params_small::TPI;
-        kernel = kernel_double_add<cgbn_params_small>;
-      } else if (BITS == cgbn_params_medium::BITS) {
-        TPI = cgbn_params_medium::TPI;
-        kernel = kernel_double_add<cgbn_params_medium>;
-#ifndef IS_DEV_BUILD
-      } else if (BITS == cgbn_params_1536::BITS) {
-        TPI = cgbn_params_1536::TPI;
-        kernel = kernel_double_add<cgbn_params_1536>;
-      } else if (BITS == cgbn_params_2048::BITS) {
-        TPI = cgbn_params_2048::TPI;
-        kernel = kernel_double_add<cgbn_params_2048>;
-      } else if (BITS == cgbn_params_3072::BITS) {
-        TPI = cgbn_params_3072::TPI;
-        kernel = kernel_double_add<cgbn_params_3072>;
-      } else if (BITS == cgbn_params_4096::BITS) {
-        TPI = cgbn_params_4096::TPI;
-        kernel = kernel_double_add<cgbn_params_4096>;
-#endif
-      } else {
-        outputf (OUTPUT_ERROR, "CGBN kernel not found for %d bits\n", BITS);
-        return ECM_ERROR;
-      }
-
       IPB = TPB / TPI;
       BLOCK_COUNT = (curves + IPB - 1) / IPB;
-
-      break;
-    }
   }
   if (BITS == 0 || kernel == NULL)
     {

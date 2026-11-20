@@ -23,6 +23,9 @@ MA 02110-1301, USA. */
 #include <stdlib.h>
 #include "sp.h"
 #include "ecm-impl.h"
+#if defined(WITH_GPU) && !defined(TUNE)
+#include "gpu_ntt.h"
+#endif
 
 /* Tables for the maximum possible modulus (in bit size) for different 
    transform lengths l.
@@ -199,6 +202,7 @@ mpzspm_init (spv_size_t max_len, mpz_t modulus)
   CHECK(mpzspm->spm == NULL, "Out of memory in mpzspm_init()\n",
         error_clear_mpzspm);
   mpzspm->sp_num = 0;
+  mpzspm->gpu = NULL;
 
   /* product of primes selected so far */
   mpz_init_set_ui (P, 1UL);
@@ -331,6 +335,9 @@ mpzspm_init (spv_size_t max_len, mpz_t modulus)
   if (test_verbose (OUTPUT_DEVVERBOSE))
     outputf (OUTPUT_DEVVERBOSE, "mpzspm_init took %lums\n", cputime() - st);
 
+#if defined(WITH_GPU) && !defined(TUNE)
+  gpu_mpzspm_init (mpzspm);
+#endif
   return mpzspm;
   
   /* Error cases: free memory we allocated so far */
@@ -378,6 +385,10 @@ mpzspm_product_tree_clear (mpzspm_t mpzspm)
 void mpzspm_clear (mpzspm_t mpzspm)
 {
   unsigned int i;
+
+#if defined(WITH_GPU) && !defined(TUNE)
+  gpu_mpzspm_clear (mpzspm);
+#endif
 
   mpzspm_product_tree_clear (mpzspm);
 

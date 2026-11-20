@@ -27,12 +27,29 @@ MA 02110-1301, USA. */
 #endif
 #include "ecm-impl.h"
 #include "sp.h"
+#if defined(WITH_GPU) && !defined(TUNE)
+#include "gpu_ntt.h"
+#endif
 
 mpzspv_t
 mpzspv_init (spv_size_t len, mpzspm_t mpzspm)
 {
+#if defined(WITH_GPU) && !defined(TUNE)
+  mpzspv_t x;
+  if ((x = gpu_mpzspv_init (len, mpzspm)) != NULL)
+    return x;
+#endif
+  return mpzspv_init_cpu (len, mpzspm);
+}
+
+/* sp_num rows of len words in host memory. */
+mpzspv_t
+mpzspv_init_cpu (spv_size_t len, mpzspm_t mpzspm)
+{
   unsigned int i;
-  mpzspv_t x = (mpzspv_t) malloc (mpzspm->sp_num * sizeof (spv_t));
+  mpzspv_t x;
+
+  x = (mpzspv_t) malloc (mpzspm->sp_num * sizeof (spv_t));
   
   if (x == NULL)
     return NULL;
@@ -60,7 +77,11 @@ mpzspv_clear (mpzspv_t x, mpzspm_t mpzspm)
   unsigned int i;
 	
   ASSERT (mpzspv_verify (x, 0, 0, mpzspm));
-  
+
+#if defined(WITH_GPU) && !defined(TUNE)
+  if (gpu_mpzspv_clear (x, mpzspm))
+    return;
+#endif
   for (i = 0; i < mpzspm->sp_num; i++)
     sp_aligned_free (x[i]);
   
@@ -354,6 +375,17 @@ void
 mpzspv_from_mpzv (mpzspv_t x, const spv_size_t offset, const mpzv_t mpzv,
     const spv_size_t len, mpzspm_t mpzspm)
 {
+#if defined(WITH_GPU) && !defined(TUNE)
+  if (gpu_mpzspv_from_mpzv (x, offset, mpzv, len, mpzspm))
+    return;
+#endif
+  mpzspv_from_mpzv_cpu (x, offset, mpzv, len, mpzspm);
+}
+
+void
+mpzspv_from_mpzv_cpu (mpzspv_t x, const spv_size_t offset, const mpzv_t mpzv,
+    const spv_size_t len, mpzspm_t mpzspm)
+{
   long i;
   ASSERT (mpzspv_verify (x, offset + len, 0, mpzspm));
   ASSERT (sizeof (mp_limb_t) >= sizeof (sp_t));
@@ -414,6 +446,17 @@ mpzspv_from_mpzv (mpzspv_t x, const spv_size_t offset, const mpzv_t mpzv,
  * memory: MPZSPV_NORMALISE_STRIDE floats */
 void
 mpzspv_to_mpzv (mpzspv_t x, spv_size_t offset, mpzv_t mpzv,
+    spv_size_t len, mpzspm_t mpzspm)
+{
+#if defined(WITH_GPU) && !defined(TUNE)
+  if (gpu_mpzspv_to_mpzv (x, offset, mpzv, len, mpzspm))
+    return;
+#endif
+  mpzspv_to_mpzv_cpu (x, offset, mpzv, len, mpzspm);
+}
+
+void
+mpzspv_to_mpzv_cpu (mpzspv_t x, spv_size_t offset, mpzv_t mpzv,
     spv_size_t len, mpzspm_t mpzspm)
 {
   unsigned int i;
@@ -534,6 +577,17 @@ void
 mpzspv_normalise (mpzspv_t x, spv_size_t offset, spv_size_t len,
     mpzspm_t mpzspm)
 {
+#if defined(WITH_GPU) && !defined(TUNE)
+  if (gpu_mpzspv_normalise (x, offset, len, mpzspm))
+    return;
+#endif
+  mpzspv_normalise_cpu (x, offset, len, mpzspm);
+}
+
+void
+mpzspv_normalise_cpu (mpzspv_t x, spv_size_t offset, spv_size_t len,
+    mpzspm_t mpzspm)
+{
   unsigned int i, j, sp_num = mpzspm->sp_num;
   spv_size_t k, l;
   sp_t v;
@@ -556,7 +610,7 @@ mpzspv_normalise (mpzspv_t x, spv_size_t offset, spv_size_t len,
       fprintf (stderr, "Cannot allocate memory in mpzspv_normalise\n");
       exit (1);
     }
-  t = mpzspv_init (MPZSPV_NORMALISE_STRIDE, mpzspm);
+  t = mpzspv_init_cpu (MPZSPV_NORMALISE_STRIDE, mpzspm);
   
   memset (s, 0, 3 * MPZSPV_NORMALISE_STRIDE * sizeof (sp_t));
 
@@ -635,6 +689,17 @@ mpzspv_normalise (mpzspv_t x, spv_size_t offset, spv_size_t len,
 
 void
 mpzspv_to_ntt (mpzspv_t x, spv_size_t offset, spv_size_t len,
+    spv_size_t ntt_size, int monic, mpzspm_t mpzspm)
+{
+#if defined(WITH_GPU) && !defined(TUNE)
+  if (gpu_mpzspv_to_ntt (x, offset, len, ntt_size, monic, mpzspm))
+    return;
+#endif
+  mpzspv_to_ntt_cpu (x, offset, len, ntt_size, monic, mpzspm);
+}
+
+void
+mpzspv_to_ntt_cpu (mpzspv_t x, spv_size_t offset, spv_size_t len,
     spv_size_t ntt_size, int monic, mpzspm_t mpzspm)
 {
   unsigned int i;
@@ -721,6 +786,22 @@ mpzspv_random (mpzspv_t x, spv_size_t offset, spv_size_t len, mpzspm_t mpzspm)
 
 void
 mpzspv_mul_ntt (mpzspv_t r, const spv_size_t offsetr, 
+    mpzspv_t x, const spv_size_t offsetx, const spv_size_t lenx,
+    mpzspv_t y, const spv_size_t offsety, const spv_size_t leny,
+    const spv_size_t ntt_size, const int monic, const spv_size_t monic_pos, 
+    mpzspm_t mpzspm, const int steps)
+{
+#if defined(WITH_GPU) && !defined(TUNE)
+  if (gpu_mpzspv_mul_ntt (r, offsetr, x, offsetx, lenx, y, offsety, leny,
+                          ntt_size, monic, monic_pos, mpzspm, steps))
+    return;
+#endif
+  mpzspv_mul_ntt_cpu (r, offsetr, x, offsetx, lenx, y, offsety, leny,
+                      ntt_size, monic, monic_pos, mpzspm, steps);
+}
+
+void
+mpzspv_mul_ntt_cpu (mpzspv_t r, const spv_size_t offsetr, 
     mpzspv_t x, const spv_size_t offsetx, const spv_size_t lenx,
     mpzspv_t y, const spv_size_t offsety, const spv_size_t leny,
     const spv_size_t ntt_size, const int monic, const spv_size_t monic_pos, 

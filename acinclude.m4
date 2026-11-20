@@ -404,7 +404,7 @@ AC_ARG_ENABLE(gpu,
     [ enable_gpu="yes"
       AS_CASE(["x$enableval"],
         [ xyes ], [],
-        [ x[[2-9]][[0-9]] ], [ WANTED_GPU_ARCH="$enableval" ],
+        [ x[[2-9]][[0-9]] | x[[1-9]][[0-9]][[0-9]] ], [ WANTED_GPU_ARCH="$enableval" ],
         [ AC_MSG_ERROR([Didn't recognize GPU_ARCH="$enableval"]) ])
     ]) ])
 
@@ -563,7 +563,7 @@ AS_IF([test "x$enable_gpu" = "xyes" ],
       
     dnl Check which GPU architecture nvcc knows
     GPU_ARCH=""
-    m4_foreach_w([compute_capability], [35 37 50 52 53 60 61 62 70 72 75 80 86 87 90],
+    m4_foreach_w([compute_capability], [35 37 50 52 53 60 61 62 70 72 75 80 86 87 89 90 100 103 110 120 121],
       [
         testcc=compute_capability
         AS_IF([test -z "$WANTED_GPU_ARCH" -o "$WANTED_GPU_ARCH" = "$testcc"],

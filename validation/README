@@ -1,0 +1,17 @@
+Phase 4 validation of libecmcgbn against stock GMP-ECM (Fedora gmp-ecm).
+
+  cd validation && ./run.sh            # the installed /usr/bin/ecmcgbn
+  G=/path/to/ecm ./run.sh               # another build
+
+A. factor agreement, 256-4096 bits, N = p68 * q: the curves (-gpu, 512
+   curves) that find p, batched and per curve, must be the same, and stock
+   gmp-ecm (-param 3, -ntt above 1920 bits) must find p in the same step on
+   each of them, and nothing on 12-13 others.
+B. ECM_GPU_BATCH_CHECK=1: every curve's stage-2 product equal to stage2.c's
+   (abort otherwise), 32 curves, B1=1e6 (dF=4096) and 3e6 (dF=16384),
+   256-4096 bits.
+C. one curve, B2=1e11 (dF=65536), ECM_GPU_NTT_CHECK=1 ECM_GPU_ROOTS_CHECK=1:
+   every NTT word and every root compared with the CPU's.
+D. P-1 and P+1 with ECM_GPU_NTT_CHECK=1, and the same result as stock.
+
+Ends with "### failures: 0". About 45 minutes on an RTX PRO 4500.

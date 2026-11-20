@@ -1,4 +1,5 @@
 #include "ecm-gpu.h"
+#include <string.h>
 
 #ifdef WITH_GPU
 
@@ -418,73 +419,206 @@ gpu_ecm (mpz_t f, const ecm_params params, ecm_params mutable_params, mpz_t n, d
   if (mpz_cmp (B2, B2min) < 0)
       goto end_gpu_ecm_factors;
 
-  st2 = cputime ();
+  /* wall clock: stage 2 runs on the GPU and on several threads, so the
+     process' CPU time says little */
+  st2 = realtime ();
 
   P.disc = 0; /* For stage2 this needs to be 0, in order not to use CM stuff */
 
-  for (i = 0; i < nb_curves; i++)
+  /* Stage 2 of several curves at once (each mostly on the GPU, see
+     gpu_ntt.cu, gpu_roots.cu, with CPU work in between): ECM_GPU_STAGE2_THREADS
+     threads (default 4), each with its own copy of the modulus (mpres
+     operations use its scratch values) and of the curve. Fermat numbers
+     (Schoenhage-Strassen with a static scratch) keep one thread. */
+  {
+    int nthreads = 4;
+    const char *e = getenv ("ECM_GPU_STAGE2_THREADS");
+    if (e != NULL && atoi (e) > 0)
+      nthreads = atoi (e);
+    if (modulus->repr == ECM_MOD_BASE2 && modulus->Fermat > 0)
+      nthreads = 1;
+    if (nthreads > (int) nb_curves)
+      nthreads = nb_curves;
+
+    /* res[i]: -1 = stage 2 still to do (per curve, below), else its
+       result. First all curves at once on the GPU (ecm_stage2_batch),
+       unless ECM_GPU_BATCH=0; it hands back (-1) the curves it cannot
+       do exactly (a value not invertible in its tables of roots). */
+    int *res = (int *) malloc (nb_curves * sizeof (int));
+    ASSERT_ALWAYS (res != NULL);
+    for (i = 0; i < nb_curves; i++)
+      res[i] = -1;
     {
-      /* hack to reduce verbose Step 2 */
-      if (params->verbose > 0)
-        set_verbose (params->verbose-1);
-
-      if (test_verbose (OUTPUT_RESVERBOSE))
-        outputf (OUTPUT_RESVERBOSE, "x=%Zd\n", factors[i]);
-
-      if (params->stop_asap != NULL && params->stop_asap())
-          goto end_gpu_ecm_rhotable;
-
-      mpres_set_z (P.x, factors[i], modulus);
-      mpres_set_ui (P.y, 1, modulus);
-      A_from_sigma (tmp_A, i+firstsigma_ui, modulus->orig_modulus);
-      mpres_set_z (P.A, tmp_A, modulus);
-
-      /* compute stage 2 */
-      youpi = montgomery_to_weierstrass (factors[i], P.x, P.y, P.A, modulus);
-      if (youpi != ECM_NO_FACTOR_FOUND)
-        goto next_curve;
-
-      if (test_verbose (OUTPUT_RESVERBOSE) && youpi == ECM_NO_FACTOR_FOUND
-          && mpz_cmp (B2, B2min) >= 0)
+      const char *eb = getenv ("ECM_GPU_BATCH");
+      if (!(eb != NULL && strcmp (eb, "0") == 0) && params->use_ntt &&
+          params->TreeFilename == NULL &&
+          !(modulus->repr == ECM_MOD_BASE2 && modulus->Fermat > 0))
         {
-          mpz_t t;
-
-          mpz_init (t);
-          mpres_get_z (t, P.x, modulus);
-          outputf (OUTPUT_RESVERBOSE, "After switch to Weierstrass form, "
-                                      "P=(%Zd", t);
-          mpres_get_z (t, P.y, modulus);
-          outputf (OUTPUT_RESVERBOSE, ", %Zd)\n", t);
-          mpres_get_z (t, P.A, modulus);
-          outputf (OUTPUT_RESVERBOSE, "on curve Y^2 = X^3 + %Zd * X + b\n",
-                       t);
-          mpz_clear (t);
-        }
-
-      youpi = stage2 (factors[i], &P, modulus, dF, params->k, &root_params,
-                      params->use_ntt, params->TreeFilename, i+1, params->stop_asap);
-
-    next_curve:
-      set_verbose (params->verbose);
-
-      if (youpi != ECM_NO_FACTOR_FOUND)
-        {
-          array_found[i] = youpi;
-          outputf (OUTPUT_NORMAL, "GPU: factor %Zd found in Step 2 with"
-                " curve %u (-sigma 3:%u)\n", factors[i], i, i+firstsigma_ui);
-          /* factor_found corresponds to the first factor found */
-          if (factor_found == ECM_NO_FACTOR_FOUND)
-            factor_found = youpi;
+          curve *Wc = (curve *) malloc (nb_curves * sizeof (curve));
+          unsigned int *idx = (unsigned int *) malloc (nb_curves *
+                                                       sizeof (unsigned int));
+          mpz_t *fb = (mpz_t *) malloc (nb_curves * sizeof (mpz_t));
+          int *rb = (int *) malloc (nb_curves * sizeof (int));
+          unsigned int nbt = 0, j;
+          ASSERT_ALWAYS (Wc && idx && fb && rb);
+          for (i = 0; i < nb_curves; i++)
+            {
+              int y;
+              curve *Q = &Wc[nbt];
+              mpres_init (Q->x, modulus);
+              mpres_init (Q->y, modulus);
+              mpres_init (Q->A, modulus);
+              Q->disc = 0;
+              mpres_set_z (Q->x, factors[i], modulus);
+              mpres_set_ui (Q->y, 1, modulus);
+              A_from_sigma (tmp_A, i+firstsigma_ui, modulus->orig_modulus);
+              mpres_set_z (Q->A, tmp_A, modulus);
+              y = montgomery_to_weierstrass (factors[i], Q->x, Q->y, Q->A,
+                                             modulus);
+              if (y != ECM_NO_FACTOR_FOUND)
+                {
+                  res[i] = y;
+                  mpres_clear (Q->x, modulus);
+                  mpres_clear (Q->y, modulus);
+                  mpres_clear (Q->A, modulus);
+                  continue;
+                }
+              mpz_init (fb[nbt]);
+              idx[nbt++] = i;
+            }
+          if (params->verbose > 0)
+            set_verbose (params->verbose-1);
+          if (nbt > 0 && ecm_stage2_batch (fb, rb, nbt, Wc, modulus, dF,
+                                           params->k, &root_params))
+            for (j = 0; j < nbt; j++)
+              if (rb[j] >= 0)
+                {
+                  res[idx[j]] = rb[j];
+                  if (rb[j] != ECM_NO_FACTOR_FOUND)
+                    mpz_set (factors[idx[j]], fb[j]);
+                }
+          set_verbose (params->verbose);
+          for (j = 0; j < nbt; j++)
+            {
+              mpz_clear (fb[j]);
+              mpres_clear (Wc[j].x, modulus);
+              mpres_clear (Wc[j].y, modulus);
+              mpres_clear (Wc[j].A, modulus);
+            }
+          free (Wc);
+          free (idx);
+          free (fb);
+          free (rb);
         }
     }
+    for (i = 0; i < nb_curves; i++)
+      if (res[i] > 0)
+        array_found[i] = res[i];
+
+    /* hack to reduce verbose Step 2 */
+    if (params->verbose > 0)
+      set_verbose (params->verbose-1);
+
+#if defined(_OPENMP)
+#pragma omp parallel num_threads(nthreads)
+#endif
+    {
+      mpmod_t mod;
+      curve Q;
+      mpz_t tA;
+      root_params_t rp;
+      long ci;
+
+      mpmod_init_set (mod, modulus);
+      mpres_init (Q.x, mod);
+      mpres_init (Q.y, mod);
+      mpres_init (Q.A, mod);
+      Q.disc = 0;
+      mpz_init (tA);
+      rp = root_params;
+      mpz_init_set (rp.i0, root_params.i0);
+
+#if defined(_OPENMP)
+#pragma omp for schedule(dynamic, 1)
+#endif
+      for (ci = 0; ci < (long) nb_curves; ci++)
+        {
+          int y;
+
+          if (test_verbose (OUTPUT_RESVERBOSE))
+            outputf (OUTPUT_RESVERBOSE, "x=%Zd\n", factors[ci]);
+
+          if (params->stop_asap != NULL && params->stop_asap())
+            continue;
+          if (res[ci] != -1) /* done by the batch */
+            continue;
+
+          mpres_set_z (Q.x, factors[ci], mod);
+          mpres_set_ui (Q.y, 1, mod);
+          A_from_sigma (tA, ci+firstsigma_ui, mod->orig_modulus);
+          mpres_set_z (Q.A, tA, mod);
+
+          /* compute stage 2 */
+          y = montgomery_to_weierstrass (factors[ci], Q.x, Q.y, Q.A, mod);
+          if (y == ECM_NO_FACTOR_FOUND)
+            {
+              if (test_verbose (OUTPUT_RESVERBOSE))
+                {
+                  mpz_t t;
+
+                  mpz_init (t);
+                  mpres_get_z (t, Q.x, mod);
+                  outputf (OUTPUT_RESVERBOSE, "After switch to Weierstrass "
+                           "form, P=(%Zd", t);
+                  mpres_get_z (t, Q.y, mod);
+                  outputf (OUTPUT_RESVERBOSE, ", %Zd)\n", t);
+                  mpres_get_z (t, Q.A, mod);
+                  outputf (OUTPUT_RESVERBOSE, "on curve Y^2 = X^3 + %Zd * X "
+                           "+ b\n", t);
+                  mpz_clear (t);
+                }
+
+              y = stage2 (factors[ci], &Q, mod, dF, params->k, &rp,
+                          params->use_ntt, params->TreeFilename, ci+1,
+                          params->stop_asap);
+            }
+
+          if (y != ECM_NO_FACTOR_FOUND)
+            array_found[ci] = y; /* reported below, at normal verbosity */
+        }
+
+      mpz_clear (rp.i0);
+      mpz_clear (tA);
+      mpres_clear (Q.x, mod);
+      mpres_clear (Q.y, mod);
+      mpres_clear (Q.A, mod);
+      mpmod_clear (mod);
+    }
+    set_verbose (params->verbose);
+    free (res);
+
+    if (params->stop_asap != NULL && params->stop_asap())
+      goto end_gpu_ecm_rhotable;
+
+    /* factor_found corresponds to the first factor found (curve order) */
+    for (i = 0; i < nb_curves; i++)
+      if (array_found[i] != ECM_NO_FACTOR_FOUND)
+        {
+          outputf (OUTPUT_NORMAL, "GPU: factor %Zd found in Step 2 with"
+                   " curve %u (-sigma 3:%u)\n", factors[i], i,
+                   i+firstsigma_ui);
+          if (factor_found == ECM_NO_FACTOR_FOUND)
+            factor_found = array_found[i];
+        }
+  }
 
   /* If a factor was found in Step 2, make sure we set
    * our return value "youpi" appropriately
    */
   youpi = factor_found;
 
-  st2 = elltime (st2, cputime ());
-  outputf (OUTPUT_NORMAL, "Computing %u Step 2 on CPU took %ldms\n",
+  st2 = elltime (st2, realtime ());
+  outputf (OUTPUT_NORMAL, "Computing %u Step 2 took %ldms (wall clock)\n",
                           nb_curves, st2);
   outputf (OUTPUT_VERBOSE, "Throughput: %.3f Step 2 per second ",
                            1000.0 * nb_curves /st2);

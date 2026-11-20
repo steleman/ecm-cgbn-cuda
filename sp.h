@@ -199,6 +199,7 @@ typedef struct
     /* product tree to speed up conversion from mpz to sp */
     mpzv_t *T;            /* product tree */
     unsigned int d;       /* ceil(log(sp_num)/log(2)) */
+    void *gpu;            /* device tables of gpu_ntt.cu, or NULL */
   } __mpzspm_struct;
 
 typedef __mpzspm_struct * mpzspm_t;
@@ -454,6 +455,10 @@ sp_pow (sp_t x, sp_t a, sp_t m, sp_t d)
 /* x / 2 mod m */
 #define sp_div_2(x,m) (((x) & 1) ? (m) - (((m) - (x)) >> 1) : ((x) >> 1))
   
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 int sp_prime (sp_t);
 
 /* spm */
@@ -522,11 +527,33 @@ void mpzspv_from_ntt (mpzspv_t, spv_size_t, spv_size_t, spv_size_t, mpzspm_t);
 void mpzspv_mul_ntt (mpzspv_t, spv_size_t, mpzspv_t, spv_size_t, spv_size_t, 
     mpzspv_t, spv_size_t, spv_size_t, spv_size_t, int, spv_size_t, mpzspm_t, 
     int);
+/* The CPU code of mpzspv_mul_ntt / mpzspv_to_ntt (which may run on the
+   GPU instead, gpu_ntt.cu). */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void mpzspv_mul_ntt_cpu (mpzspv_t, spv_size_t, mpzspv_t, spv_size_t,
+    spv_size_t, mpzspv_t, spv_size_t, spv_size_t, spv_size_t, int,
+    spv_size_t, mpzspm_t, int);
+void mpzspv_to_ntt_cpu (mpzspv_t, spv_size_t, spv_size_t, spv_size_t, int,
+    mpzspm_t);
+void mpzspv_from_mpzv_cpu (mpzspv_t, const spv_size_t, const mpzv_t,
+    const spv_size_t, mpzspm_t);
+void mpzspv_to_mpzv_cpu (mpzspv_t, spv_size_t, mpzv_t, spv_size_t, mpzspm_t);
+void mpzspv_normalise_cpu (mpzspv_t, spv_size_t, spv_size_t, mpzspm_t);
+mpzspv_t mpzspv_init_cpu (spv_size_t, mpzspm_t);
+#ifdef __cplusplus
+}
+#endif
 void mpzspv_random (mpzspv_t, spv_size_t, spv_size_t, mpzspm_t);
 void mpzspv_to_dct1 (mpzspv_t, mpzspv_t, spv_size_t, spv_size_t, mpzspv_t, 
     mpzspm_t);
 void mpzspv_mul_by_dct (mpzspv_t, const mpzspv_t, spv_size_t, const mpzspm_t, 
     int);
 void mpzspv_sqr_reciprocal (mpzspv_t, spv_size_t, const mpzspm_t);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _SP_H */

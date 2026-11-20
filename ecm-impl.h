@@ -219,6 +219,8 @@ typedef struct
   unsigned int size_T; /* How many entries T has */
   mpres_t *T;          /* For temp values. FIXME: should go! */
   curve *X;            /* The curve the points are on */
+  void *gpu;           /* the table on the GPU (gpu_roots.h), or NULL */
+  void *check;         /* ECM_GPU_ROOTS_CHECK=1: the CPU's own state */
 } ecm_roots_state_t;
 
 
@@ -364,6 +366,9 @@ void  pp1_mul_prac     (mpres_t, ecm_uint, mpmod_t, mpres_t, mpres_t,
 #define stage2 __ECM(stage2)
 int     stage2 (mpz_t, void *, mpmod_t, unsigned long, unsigned long,
                 root_params_t *, int, char *, unsigned int, int (*)(void));
+#define ecm_stage2_batch __ECM(ecm_stage2_batch)
+int ecm_stage2_batch (mpz_t *, int *, unsigned, curve *, mpmod_t,
+                      unsigned long, unsigned long, root_params_t *);
 #define init_progression_coeffs __ECM(init_progression_coeffs)
 listz_t init_progression_coeffs (mpz_t, const unsigned long, const unsigned long, 
 				 const unsigned int, const unsigned int, 

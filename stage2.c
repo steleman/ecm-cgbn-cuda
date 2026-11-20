@@ -323,6 +323,10 @@ memory_use (unsigned long dF, unsigned int sp_num, unsigned int Ftreelvl,
    Return value: 2 (step number) iff a factor was found,
                  or ECM_ERROR if an error occurred.
 */
+/* If not NULL, receives the product of the values (before the gcd) of the
+   next stage2 call in this thread (the GPU batch's check mode). */
+__thread mpz_ptr ecm_stage2_product = NULL;
+
 int
 stage2 (mpz_t f, void *X, mpmod_t modulus, unsigned long dF, unsigned long k, 
         root_params_t *root_params, int use_ntt, char *TreeFilename,
@@ -724,6 +728,8 @@ stage2 (mpz_t f, void *X, mpmod_t modulus, unsigned long dF, unsigned long k,
 
   st = cputime ();
   list_mulup (T, dF, n, T[dF]);
+  if (ecm_stage2_product != NULL)
+    mpz_set (ecm_stage2_product, T[dF - 1]);
   outputf (OUTPUT_VERBOSE, "Computing product of all F(g_i) took %ldms\n", 
            elltime (st, cputime ()));
 

@@ -84,6 +84,21 @@ stop_asap_test (void)
   return exit_asap_value;
 }
 
+/* the largest input (in limbs) for which the NTT stage 2 is the default */
+#ifdef WITH_GPU
+int gpu_ntt_active (void); /* gpu_ntt.cu */
+#define GPU_NTT_SIZE_THRESHOLD 64 /* GPU_ROOTS_MAX_BITS (gpu_roots.h) / 64 */
+#endif
+static size_t
+ntt_size_threshold (void)
+{
+#ifdef WITH_GPU
+  if (gpu_ntt_active ())
+    return GPU_NTT_SIZE_THRESHOLD;
+#endif
+  return NTT_SIZE_THRESHOLD;
+}
+
 static void
 usage (void)
 {
@@ -1461,9 +1476,11 @@ main (int argc, char *argv[])
       mpz_set (params->go, go.Candi.n); /* may change if contains N */
       mpz_set (params->B2min, B2min); /* may change with -c */
       /* Default, for P-1/P+1 with old stage 2 and ECM, use NTT only 
-         for small input */
+         for small input; when the NTTs run on the GPU (libecmcgbn) they
+         are faster up to the largest modulus the GPU stage 2 takes
+         (2048 bits, B2 = 1e11: 2.5 s against 40.5 s without NTT) */
       if (use_ntt == 1 && (method == ECM_ECM || S != ECM_DEFAULT_S)) 
-        params->use_ntt = (mpz_size (n.n) <= NTT_SIZE_THRESHOLD);
+        params->use_ntt = (mpz_size (n.n) <= ntt_size_threshold ());
       else 
         params->use_ntt = use_ntt;
 

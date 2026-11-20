@@ -87,8 +87,8 @@ To use your GPU for step 1, just add the -gpu option:
 
   $ echo "(2^835+1)/33" | ./ecm -gpu 1e4
 
-It will compute step 1 on the GPU, and then perform step 2 on the CPU (not in
-parallel).
+It will compute step 1 on the GPU, and then step 2 of all the curves, also on
+the GPU (see section 5).
 
 The only parametrization compatible with GPU code is "-param 3".
 
@@ -141,3 +141,51 @@ In general the best solution is to restart the machine.
 Please report to sethtroisi (by email or on mersenneforum) any problems,
 bugs, or observations.
 
+##############################################################################
+
+5. Stage 2 on the GPU (libecmcgbn)
+
+This version also runs stage 2 on the GPU, with the same results as the CPU
+code (the same products, hence the same factors):
+
+  - the products of polynomials in residues modulo 62-bit primes (the
+    NTTs of mpzspv.c, word for word), the conversions to and from residues
+    (explicit CRT), the product trees and the multipoint evaluation;
+  - the roots of F and G (the tables of finite differences of ecm2.c), with
+    complete projective additions, made affine with batched inversions;
+  - with -gpu, stage 2 of all the curves at once: one F, 1/F and H = prod
+    (G - F) mod F per curve, evaluated on the GPU, curves in chunks as the
+    GPU's memory allows.
+
+Stage 1 kernels exist for every 128 bits from 256 to 4096 bits (N may fill
+the kernel). The GPU stage 2 takes N of up to 4096 bits. Stock GMP-ECM uses
+its NTT stage 2 by default only up to 1920 bits (30 limbs), above which its
+non-NTT CPU code is faster; with the GPU NTT the default limit is 4096 bits
+(-no-ntt still forces the CPU code). One curve, stage 2 time:
+
+  2048 bits, B2=1e9:   no NTT (CPU) 3.3 s, NTT on the GPU 0.9 s
+  2048 bits, B2=1e11:  no NTT (CPU) 40.5 s, NTT on the GPU 2.5 s
+  4096 bits, B2=1e11:  no NTT (CPU) 93.2 s, NTT on the GPU 5.1 s
+
+Environment variables (all optional):
+
+  ECM_GPU_NTT=0             stage 2 arithmetic on the CPU
+  ECM_GPU_ROOTS=0           roots of F and G on the CPU
+  ECM_GPU_BATCH=0           with -gpu, stage 2 curve by curve (not batched)
+  ECM_GPU_BATCH_CURVES=n    at most n curves per batch
+  ECM_GPU_STAGE2_THREADS=n  curves at a time when not batched (default 4)
+  ECM_GPU_ROOTS_ADDS=n      faster tables of roots (n progressions per
+                            addition chain); can miss the rare factors that
+                            the CPU finds while computing the tables
+  ECM_GPU_NTT_CHECK=1, ECM_GPU_ROOTS_CHECK=1, ECM_GPU_BATCH_CHECK=1
+                            compare with the CPU code (slow; abort on a
+                            difference)
+
+Measured on RSA-1024 (309 digits), RTX PRO 4500 Blackwell (82 SMs), 32-core
+x86_64, B1=1e6, B2=1045563762 (default):
+
+  672 curves, stage 2:  CPU (32 threads) 58.6 s, GPU curve by curve 128 s,
+                        GPU batched 19.5 s
+  5248 curves:          stage 1 46.7 s, stage 2 (batched) 151.7 s
+  one curve, B2=3.2e12: stage 2 193 s on the CPU (32 threads), 12.5 s on
+                        the GPU
